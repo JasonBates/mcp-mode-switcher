@@ -1,0 +1,8 @@
+[project]
+name = "mcp-mode-switcher"
+version = "0.1.0"
+description = "MCP Mode Switcher - Switch between different MCP configuration profiles"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+]
