@@ -2,11 +2,48 @@
 """MCP Mode Switcher - Switch between different MCP configuration profiles."""
 
 import json
+import logging
+import signal
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
 from fastmcp import FastMCP
+
+# Set up file logging for crash diagnosis
+LOG_DIR = Path.home() / "Library" / "Logs" / "mcp-mode-switcher"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "server.log"
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stderr),  # Also output to stderr for Claude Desktop logs
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Register signal handlers to catch external termination
+def signal_handler(signum, frame):
+    sig_name = signal.Signals(signum).name
+    logger.critical(f"Received signal {sig_name} ({signum}) - server being terminated externally!")
+    sys.exit(1)
+
+# Catch common termination signals
+for sig in [signal.SIGTERM, signal.SIGINT, signal.SIGHUP]:
+    try:
+        signal.signal(sig, signal_handler)
+    except (OSError, ValueError):
+        pass  # Some signals can't be caught
+
+# Log startup
+logger.info("=" * 50)
+logger.info("MCP Mode Switcher starting...")
+logger.info(f"Python: {sys.version}")
+logger.info(f"Log file: {LOG_FILE}")
 
 # Initialize the MCP server
 mcp = FastMCP("mcp-mode-switcher")
@@ -24,7 +61,14 @@ def load_json_file(path: Path) -> dict | None:
     try:
         with open(path, "r") as f:
             return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        logger.debug(f"File not found: {path}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.warning(f"JSON decode error in {path}: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error loading {path}: {e}", exc_info=True)
         return None
 
 
@@ -74,8 +118,16 @@ def save_json_file(path: Path, data: dict) -> bool:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
+        logger.debug(f"Saved JSON to {path}")
         return True
-    except Exception:
+    except PermissionError as e:
+        logger.error(f"Permission denied writing {path}: {e}")
+        return False
+    except OSError as e:
+        logger.error(f"OS error writing {path}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error saving {path}: {e}", exc_info=True)
         return False
 
 
@@ -113,6 +165,7 @@ def list_modes() -> str:
 
     Note: mcp-mode-switcher (~2k tokens) is always included in every profile.
     """
+    logger.info("Tool called: list_modes()")
     modes = get_modes()
 
     if not modes:
@@ -152,6 +205,7 @@ def current_mode() -> str:
     - "custom" if the current config doesn't match any profile
     - Error message if config cannot be read
     """
+    logger.info("Tool called: current_mode()")
     current_config = load_json_file(CLAUDE_CONFIG_FILE)
 
     if current_config is None:
@@ -235,32 +289,47 @@ You are about to switch to **{mode}** mode:
 To proceed, call `switch_mode(mode="{mode}", confirm=True)`"""
 
     # Confirmed - perform the switch
+    logger.info(f"Tool called: switch_mode(mode={mode}, confirm=True)")
     try:
         # Create backup before switching
         backup_name = create_backup()
+        logger.info(f"Backup created: {backup_name}")
 
         # Read the new config
         new_config = load_json_file(config_path)
         if new_config is None:
+            logger.error(f"Could not read config file: {config_path}")
             return f"Error: Could not read config file: {config_path}"
 
         # Write to main config file
         with open(CLAUDE_CONFIG_FILE, "w") as f:
             json.dump(new_config, f, indent=2)
+        logger.info(f"Config file updated: {CLAUDE_CONFIG_FILE}")
 
-        # Restart Claude Desktop
-        restart_script = '''
-        osascript -e 'quit app "Claude"'
-        sleep 1
-        open -a "Claude"
-        '''
+        # Restart Claude Desktop using separate commands for better reliability
+        logger.info("Initiating Claude Desktop restart...")
+        try:
+            # Quit Claude
+            quit_result = subprocess.run(
+                ["osascript", "-e", 'quit app "Claude"'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if quit_result.returncode != 0:
+                logger.warning(f"osascript quit returned {quit_result.returncode}: {quit_result.stderr}")
 
-        subprocess.Popen(
-            restart_script,
-            shell=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
+            # Brief pause then reopen (use Popen since we won't wait for this)
+            subprocess.Popen(
+                ["bash", "-c", "sleep 1 && open -a 'Claude'"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            logger.info("Restart commands issued successfully")
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout waiting for osascript to quit Claude")
+        except Exception as e:
+            logger.error(f"Error during restart: {e}", exc_info=True)
 
         backup_msg = f"Backup saved: `{backup_name}`" if backup_name else "Warning: Backup failed"
 
@@ -272,6 +341,7 @@ Config file updated. Claude Desktop is restarting.
 (This message may not be visible as the app is restarting)"""
 
     except Exception as e:
+        logger.error(f"Failed to switch mode: {e}", exc_info=True)
         return f"Error: Failed to switch mode: {str(e)}"
 
 
@@ -291,6 +361,7 @@ def save_current_as_mode(name: str, description: str = "", token_cost: str = "un
     - Success message with the new mode details
     - Error message if the save fails
     """
+    logger.info(f"Tool called: save_current_as_mode(name={name})")
     # Validate name
     name = name.lower().strip().replace(" ", "-")
     if not name:
@@ -347,6 +418,7 @@ def list_backups() -> str:
     Backups are created automatically before each mode switch.
     They can be used to restore a previous configuration if needed.
     """
+    logger.info("Tool called: list_backups()")
     if not BACKUPS_DIR.exists():
         return "No backups found. Backups are created automatically when switching modes."
 
@@ -370,4 +442,13 @@ def list_backups() -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    try:
+        logger.info("Server initialized, starting mcp.run()...")
+        mcp.run()
+    except KeyboardInterrupt:
+        logger.info("Server stopped by keyboard interrupt")
+    except Exception as e:
+        logger.critical(f"Server crashed with unhandled exception: {e}", exc_info=True)
+        raise
+    finally:
+        logger.info("Server shutting down")
